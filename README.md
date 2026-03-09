@@ -12,6 +12,7 @@ QQ群聊 (Aiocqhttp)
 
 ## 配置
 | 配置名      | 描述 | 默认值     |
+|    :---:    |    :----:   |     :---:     |
 | autosign_daily_time | 每天打卡开始时间 | 00-00-00 |
 | auto_send_msg_random_time_range | 随机时间续火时间区间 | "9-23" |
 | autosign_group_list | 每日打卡群号列表 | 空 |
