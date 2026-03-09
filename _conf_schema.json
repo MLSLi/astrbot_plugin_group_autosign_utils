@@ -1,0 +1,32 @@
+{
+    "autosign_daily_time": {
+        "description": "每日群打卡开始时间(时-分-秒)",
+        "type": "string",
+        "hint": "",
+        "default": "00-00-00"
+    },
+    "auto_send_msg_random_time_range": {
+        "description": "随机时间续火时间区间(英文逗号隔开，左开始右结束，结束不能大于23)",
+        "type": "string",
+        "hint": "",
+        "default": "9,23"
+    },
+    "autosign_group_list": {
+        "description": "每日打卡群号列表(英文逗号隔开)",
+        "type": "string",
+        "hint": "",
+        "default": ""
+    },
+    "auto_send_msg_group_list": {
+        "description": "每日续火群号列表(英文逗号隔开)",
+        "type": "string",
+        "hint": "",
+        "default": ""
+    },
+    "autosign_delay": {
+        "description": "每日续火延迟(秒)",
+        "type": "float",
+        "hint": "",
+        "default": 1.0
+    }
+}
