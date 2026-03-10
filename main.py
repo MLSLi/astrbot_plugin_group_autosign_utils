@@ -1,5 +1,5 @@
 from datetime import datetime, timedelta
-from typing import Callable, Optional, List
+from typing import Callable, Optional, List, Dict
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.date import DateTrigger
@@ -10,7 +10,6 @@ from astrbot.api.star import Context, Star, register
 from astrbot.api import logger, AstrBotConfig
 from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import AiocqhttpMessageEvent
 
-import re
 import asyncio
 import random
 import aiohttp
@@ -340,6 +339,83 @@ class DailyRepeatingScheduler:
             self._running = False
             logger.info(f"[{self.job_id}] 已停止")
 
+class HitokotoClient:
+    def __init__(self, cache_ttl: int = 300):
+        self._session: Optional[aiohttp.ClientSession] = None
+        self._cache_ttl = cache_ttl
+        self._cache: Optional[Dict] = None
+        self._cache_time: Optional[datetime] = None
+        self._lock = asyncio.Lock()  # 防止并发请求击穿缓存
+    
+    async def _get_session(self) -> aiohttp.ClientSession:
+        """延迟初始化，复用 Session"""
+        if self._session is None or self._session.closed:
+            # 设置连接池限制
+            connector = aiohttp.TCPConnector(limit=10, limit_per_host=5)
+            self._session = aiohttp.ClientSession(connector=connector)
+        return self._session
+    
+    async def get_hitokoto(self, force_refresh: bool = False) -> str:
+        """获取一言，带缓存"""
+        if not force_refresh and self._cache and self._cache_time:
+            if datetime.now() - self._cache_time < timedelta(seconds=self._cache_ttl):
+                return self._format_result(self._cache)
+        
+        async with self._lock:  # 确保同时只有一个请求去调用 API
+            if not force_refresh and self._cache and self._cache_time:
+                if datetime.now() - self._cache_time < timedelta(seconds=self._cache_ttl):
+                    return self._format_result(self._cache)
+            
+            url = "https://v1.hitokoto.cn/"
+            try:
+                session = await self._get_session()
+                async with session.get(
+                    url, 
+                    timeout=aiohttp.ClientTimeout(total=10),
+                    headers={'Accept': 'application/json'}
+                ) as response:
+                    response.raise_for_status()
+                    data = await response.json()
+                    
+                    # 更新缓存
+                    self._cache = data
+                    self._cache_time = datetime.now()
+                    
+                    return self._format_result(data)
+                    
+            except asyncio.TimeoutError:
+                return "获取一言失败：请求超时"
+            except aiohttp.ClientResponseError as e:
+                if e.status == 429:
+                    return "获取一言失败：请求过于频繁"
+                return f"获取一言失败：服务异常（{e.status}）"
+            except aiohttp.ClientConnectorError:
+                return "获取一言失败：无法连接到服务器"
+            except Exception as e:
+                return f"获取一言失败：{str(e)}"
+    
+    def _format_result(self, data: dict) -> str:
+        """格式化输出"""
+        hitokoto = data.get("hitokoto", "这里应该有一句话...")
+        from_who = data.get("from_who") or ""
+        from_where = data.get("from") or "未知出处"
+        
+        if from_who:
+            return f"{hitokoto} —— {from_who}《{from_where}》"
+        return f"{hitokoto} —— 《{from_where}》"
+    
+    async def close(self):
+        """清理资源，建议在程序结束时调用"""
+        if self._session and not self._session.closed:
+            await self._session.close()
+    
+    # 支持 async with 语法
+    async def __aenter__(self):
+        return self
+    
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        await self.close()
+
 @register("astrbot_plugin_group_autosign_utils", "MLSLi", "自动群打卡续火工具", "1.0.0")
 class MyPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -348,13 +424,19 @@ class MyPlugin(Star):
         self.bot_instance = None
         self.random_time_scheduler = None
         self.daily_scheduler = None
+        self.hitokoto_client = None
+
         self.group_ids = []
         self.group_send_msg_idx_counter = 0
         self.group_autosign_idx_counter = 0
+
         self.success_count = 0
         self.failed_count = 0
         self.autosign_group_list_count = 0
         self.auto_send_msg_group_list_count = 0
+
+        self._sign_lock = asyncio.Lock()
+
         self.results = {
             "not_in_group": "不在群聊内",
             "no_bot_instance": "无机器人实例",
@@ -371,38 +453,14 @@ class MyPlugin(Star):
     def _filter_empty_str(self, _list):
         return [x for x in _list if x != '']
 
-    async def _get_hitokoto(self):
-        """异步获取每日一言"""
-        url = "https://v1.hitokoto.cn/"
-        
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as response:
-                    response.raise_for_status()
-                    data = await response.json()
-                    
-                    hitokoto = data.get("hitokoto", "")
-                    from_who = data.get("from_who") or "未知"
-                    from_where = data.get("from") or "未知出处"
-                    
-                    if from_who and from_who != "未知":
-                        return f"{hitokoto} —— {from_who} {from_where}"
-                    else:
-                        return f"{hitokoto} —— {from_where}"
-                        
-        except aiohttp.ClientError as e:
-            return f"获取一言失败（网络错误）: {e}"
-        except Exception as e:
-            return f"获取一言失败: {e}"
-
     async def _daily_auto_send_msg(self):
         if not self.bot_instance:
-            logger.warning("Bot 未就绪，跳过群续火")
+            logger.warning("Bot未就绪，跳过群续火")
             return
         
         group_id = int(self.auto_send_msg_group_list[self.group_send_msg_idx_counter])
 
-        hitokoto = await self._get_hitokoto()
+        hitokoto = await self.hitokoto_client.get_hitokoto()
 
         if group_id not in self.group_ids:
             logger.error(f"续火失败：不在群聊{group_id}内")
@@ -419,14 +477,15 @@ class MyPlugin(Star):
 
     async def _daily_auto_sign(self):
         if not self.bot_instance:
-            logger.warning("Bot 未就绪，跳过群打卡")
+            logger.warning("Bot未就绪，跳过群打卡")
             return
 
         group_id = int(self.autosign_group_list[self.group_autosign_idx_counter])
 
         if group_id not in self.group_ids:
             logger.warning(f"群打卡失败：不在群聊{group_id}中")
-            self.group_autosign_idx_counter += 1; self.failed_count += 1
+            self.group_autosign_idx_counter += 1
+            self.failed_count += 1
             return
         
         ret, msg = await self._auto_sign_single(group_id)
@@ -442,7 +501,9 @@ class MyPlugin(Star):
 
         if self.group_autosign_idx_counter == len(self.autosign_group_list):
             logger.info(f"每日签到完毕，成功{self.success_count}个群组，失败{self.failed_count}个群组")
-            self.group_autosign_idx_counter = 0; self.success_count = 0; self.failed_count = 0
+            self.group_autosign_idx_counter = 0
+            self.success_count = 0
+            self.failed_count = 0
 
     async def _init_random_time_scheduler(self):
         start, end = self.auto_send_msg_random_time_range; start = int(start); end = int(end)
@@ -472,6 +533,8 @@ class MyPlugin(Star):
             
         await self._init_random_time_scheduler()
         await self._init_daily_time_scheduler()
+
+        self.hitokoto_client = HitokotoClient(cache_ttl=120)
 
     async def initialize(self):
         """可选择实现异步的插件初始化方法，当实例化该插件类之后会自动调用该方法。"""
@@ -537,31 +600,39 @@ class MyPlugin(Star):
     #     except Exception as e:
     #         logger.error(f"list_groups_err: {str(e)}")
 
+    @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("single_sign")
     async def single_sign(self, event: AstrMessageEvent):
         """单个群聊签到"""
-        args = event.message_str.replace('single_sign', '', 1).strip()
-        current_group_id = event.get_group_id()
-        
-        if args:
-            if not args.isdigit():
-                yield event.plain_result("请输入合规的群号（数字）")
-                return
-            group_id = args
-        else:
-            if not current_group_id:
-                yield event.plain_result("请在群聊内使用该指令，或指定群号")
-                return
-            group_id = current_group_id
-        
-        ret, msg = await self._auto_sign_single(int(group_id))
+        async with self._sign_lock: # 哪些管理员闲的没事干一起打卡(bushi)
+            args = event.message_str.strip().split()
+            current_group_id = event.get_group_id()
 
-        if msg != "ok":
-            logger.error(f"打卡失败：{self.results}")
-            yield event.plain_result(f"打卡失败：{self.results[msg]}")
-        else:
-            logger.info(f"打卡成功：{str(ret)}")
-            yield event.plain_result("打卡成功")
+            if len(args) < 2:
+                if not current_group_id:
+                    yield event.plain_result("请在群聊内使用该指令，或指定群号")
+                    return
+                group_id = current_group_id
+            else:
+                input_id = args[1]
+                if not input_id.isdigit():
+                    yield event.plain_result("请输入合规的群号（纯数字）")
+                    return
+                group_id = input_id
+
+            try:
+                ret, msg = await self._auto_sign_single(int(group_id))
+                
+                if msg != "ok":
+                    logger.error(f"打卡失败：{self.results[msg]}")
+                    yield event.plain_result(f"打卡失败：{self.results[msg]}")
+                else:
+                    logger.info(f"打卡成功：{str(ret)}")
+                    yield event.plain_result("打卡成功")
+                    
+            except Exception as e:
+                logger.error(f"签到过程异常：{e}")
+                yield event.plain_result(f"签到异常：{str(e)}")
 
     async def terminate(self):
         """可选择实现异步的插件销毁方法，当插件被卸载/停用时会调用。"""
