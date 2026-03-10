@@ -451,7 +451,7 @@ class MyPlugin(Star):
         self.autosign_delay = config.get("autosign_delay", 2.0)
 
     def _filter_empty_str(self, _list):
-        return [x for x in _list if x != '']
+        return [x for x in _list if x]
 
     async def _daily_auto_send_msg(self):
         if not self.bot_instance:
@@ -506,7 +506,7 @@ class MyPlugin(Star):
             self.failed_count = 0
 
     async def _init_random_time_scheduler(self):
-        start, end = self.auto_send_msg_random_time_range; start = int(start); end = int(end)
+        start, end = map(int, self.auto_send_msg_random_time_range)
 
         if start > end or start < 0 or end < 0 or end > 23:
             logger.error("自动续火区间数值范围错误或数据不合法")
@@ -640,6 +640,8 @@ class MyPlugin(Star):
             await self.random_time_scheduler.stop(reset=True)
         if self.daily_scheduler:
             self.daily_scheduler.stop()
+
+        await self.hitokoto_client.close() 
 
         await asyncio.sleep(0.5)
 
