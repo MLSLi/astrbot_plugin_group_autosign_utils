@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date  # FIX 6: 导入 date 类
 from typing import Callable, Optional, List, Dict
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -34,11 +34,11 @@ class RandomTimeScheduler:
         self.scheduler: Optional[AsyncIOScheduler] = None
         self._rescheduler_id = "daily_rescheduler"
         self._is_running = False
-        self._current_date: Optional[datetime.date] = None
+        self._current_date: Optional[date] = None
 
     @property
     def is_running(self) -> bool:
-        """检查调度器是否正在运行"""
+        """检查调度器是否正在运行（非暂停状态）"""
         return self._is_running and self.scheduler is not None and self.scheduler.running
 
     async def _wrapped_fn(self):
@@ -60,13 +60,13 @@ class RandomTimeScheduler:
                 except Exception:
                     pass
 
-    def _generate_random_times(self, date: datetime.date, earliest_time: Optional[datetime] = None) -> List[datetime]:
+    def _generate_random_times(self, target_date: date, earliest_time: Optional[datetime] = None) -> List[datetime]:
         """生成指定日期的 n 个随机时间点"""
         start_sec = self.start_hour * 3600
         end_sec = (self.end_hour + 1) * 3600 - 1
 
         # 如果指定了最早时间，调整 start_sec
-        if earliest_time and earliest_time.date() == date:
+        if earliest_time and earliest_time.date() == target_date:
             earliest_sec = earliest_time.hour * 3600 + earliest_time.minute * 60 + earliest_time.second
             start_sec = max(start_sec, earliest_sec + 1)  # 至少比当前时间晚1秒
 
@@ -75,31 +75,46 @@ class RandomTimeScheduler:
             raise ValueError(f"n ({self.n}) 超过了可用秒数 ({available_seconds})")
 
         random_seconds = sorted(random.sample(range(start_sec, end_sec + 1), self.n))
-        base_time = datetime.combine(date, datetime.min.time())
+        base_time = datetime.combine(target_date, datetime.min.time())
 
         return [base_time + timedelta(seconds=int(s)) for s in random_seconds]
 
-    def _schedule_day(self, date: Optional[datetime.date] = None, force_today: bool = False):
-        if date is None:
-            date = datetime.now().date()
+    def _schedule_day(self, target_date: Optional[date] = None, force_today: bool = False):
+        if target_date is None:
+            target_date = datetime.now().date()
 
-        self._current_date = date
+        self._current_date = target_date
         self._clear_daily_jobs()
 
         now = datetime.now()
-        times = self._generate_random_times(date, earliest_time=now if not force_today else None)
+        
+        try:
+            times = self._generate_random_times(target_date, earliest_time=now if not force_today else None)
+        except ValueError as e:
+            logger.warning(f"当天无可用时间段安排任务: {e}，将推迟到明天")
+            tomorrow = target_date + timedelta(days=1)
+            next_run = datetime.combine(tomorrow, datetime.min.time()) + timedelta(seconds=1)
+            self.scheduler.add_job(
+                self._schedule_day,
+                trigger=DateTrigger(run_date=next_run),
+                args=(tomorrow, False),
+                id=self._rescheduler_id,
+                replace_existing=True,
+                misfire_grace_time=3600
+            )
+            return
+
         scheduled = 0
 
         # 添加当天的任务
         for i, run_time in enumerate(times):
-            # FIX 问题5: 如果已经过了时间，根据 force_today 决定是否延迟执行（而非跳过）
             if run_time <= now:
                 if not force_today:
                     continue
                 # force_today=True 时，过期任务安排在当前时间后5秒执行
                 run_time = now + timedelta(seconds=5)
             
-            job_id = f"random_task_{date.isoformat()}_{i:03d}"
+            job_id = f"random_task_{target_date.isoformat()}_{i:03d}"
             self.scheduler.add_job(
                 self._wrapped_fn,
                 trigger=DateTrigger(run_date=run_time),
@@ -110,11 +125,11 @@ class RandomTimeScheduler:
             )
             scheduled += 1
 
-        logger.info(f"已安排 {scheduled} 个任务在 {date} 执行")
+        logger.info(f"已安排 {scheduled} 个任务在 {target_date} 执行")
         logger.debug(f"时间点：{str(times)}")
 
         # 安排明天凌晨重新调度
-        tomorrow = date + timedelta(days=1)
+        tomorrow = target_date + timedelta(days=1)
         next_run = datetime.combine(tomorrow, datetime.min.time()) + timedelta(seconds=1)
 
         self.scheduler.add_job(
@@ -127,6 +142,7 @@ class RandomTimeScheduler:
         )
 
     async def start(self, force_reschedule: bool = True) -> bool:
+        """启动调度器（冷启动）"""
         if self.is_running:
             return False
 
@@ -147,6 +163,20 @@ class RandomTimeScheduler:
             self._schedule_day(force_today=False)
         return True
 
+    async def resume(self) -> bool:
+        """恢复暂停的调度器，不重新生成任务"""
+        if not self.scheduler:
+            logger.error("调度器未创建，无法恢复，请先调用 start()")
+            return False
+            
+        if self._is_running:
+            return False
+            
+        self.scheduler.resume()
+        self._is_running = True
+        logger.info("调度器已恢复")
+        return True
+
     async def pause(self) -> bool:
         """
         暂停调度器（保留所有任务，可 resume 恢复）
@@ -162,22 +192,25 @@ class RandomTimeScheduler:
         return True
 
     async def stop(self, reset: bool = False, timeout: Optional[float] = None) -> bool:
+        """
+        停止调度器
+        reset=True: 完全重置，下次 start 将重新创建 scheduler
+        reset=False: 仅暂停，保留 scheduler 状态，可调用 resume() 恢复
+        """
         if not self.is_running and not (self.scheduler and self.scheduler.running):
             logger.warning("调度器未在运行")
             return False
 
         try:
             if reset:
-                # 完全清理，下次 start 将重新创建 scheduler
-                self.scheduler.shutdown(wait=timeout is not None, timeout=timeout)
+                self.scheduler.shutdown(wait=False)
                 self.scheduler = None
                 self._current_date = None
                 self._is_running = False
                 logger.info("调度器已停止并重置")
             else:
                 # 只是 pause，保留 scheduler 状态
-                self.scheduler.pause()
-                self._is_running = False
+                await self.pause()
                 logger.info("调度器已停止（可恢复）")
 
             return True
@@ -316,6 +349,8 @@ class DailyRepeatingScheduler:
         """启动调度器"""
         if self._running:
             return
+        
+        self._should_stop = False
 
         trigger = CronTrigger(
             hour=self.hour,
@@ -456,6 +491,7 @@ class MyPlugin(Star):
         self.auto_send_msg_group_list_count = 0
 
         self._sign_lock = asyncio.Lock()
+        self._get_instance_lock = asyncio.Lock()
 
         self.results = {
             "not_in_group": "不在群聊内",
@@ -470,8 +506,8 @@ class MyPlugin(Star):
         self.auto_send_msg_group_list = config.get("auto_send_msg_group_list", "").split(',')
         self.autosign_delay = config.get("autosign_delay", 2.0)
 
-    def _filter_empty_str(self, _list):
-        return [x for x in _list if x]
+    def _clean_str_list(self, _list):
+        return [x.strip() for x in _list if x and x.strip()]
 
     async def _daily_auto_send_msg(self):
         if not self.auto_send_msg_group_list:
@@ -489,6 +525,11 @@ class MyPlugin(Star):
             group_id = int(self.auto_send_msg_group_list[self.group_send_msg_idx_counter])
         except (ValueError, IndexError) as e:
             logger.error(f"获取群号失败: {e}")
+            self.group_send_msg_idx_counter += 1
+            return
+
+        if not self.hitokoto_client:
+            logger.error("HitokotoClient 未初始化")
             self.group_send_msg_idx_counter += 1
             return
 
@@ -595,17 +636,20 @@ class MyPlugin(Star):
         """延迟启动"""
         try:
             await asyncio.sleep(2)  # 给 AstrBot 完成初始化的时间
+            
+            self.hitokoto_client = HitokotoClient(cache_ttl=120)
+            
             await self._init_random_time_scheduler()
             await self._init_daily_time_scheduler()
-            self.hitokoto_client = HitokotoClient(cache_ttl=120)
         except Exception as e:
             logger.exception(f"延迟启动失败: {e}")
             raise
 
     async def initialize(self):
         """可选择实现异步的插件初始化方法，当实例化该插件类之后会自动调用该方法。"""
-        self.autosign_group_list = self._filter_empty_str(self.autosign_group_list)
-        self.auto_send_msg_group_list = self._filter_empty_str(self.auto_send_msg_group_list)
+        self.autosign_group_list = self._clean_str_list(self.autosign_group_list)
+        self.auto_send_msg_group_list = self._clean_str_list(self.auto_send_msg_group_list)
+        self.auto_send_msg_random_time_range = self._clean_str_list(self.auto_send_msg_random_time_range)
 
         self.autosign_group_list_count = len(self.autosign_group_list)
         self.auto_send_msg_group_list_count = len(self.auto_send_msg_group_list)
@@ -619,27 +663,28 @@ class MyPlugin(Star):
             if isinstance(exc, asyncio.CancelledError):
                 return
             logger.exception(f"初始化任务异常: {exc}", exc_info=exc)
-            
-            self._init_task.add_done_callback(handle_task_exception)
+        
+        self._init_task.add_done_callback(handle_task_exception)
 
         logger.info(f"插件加载完毕，配置了{self.autosign_group_list_count}个自动打卡群，{self.auto_send_msg_group_list_count}个自动续火群")
 
     @filter.event_message_type(filter.EventMessageType.ALL, priority=512)
     async def _get_bot_instance(self, event: AstrMessageEvent):
-        if event.get_platform_name() == "aiocqhttp" and self.bot_instance is None and isinstance(event, AiocqhttpMessageEvent):
-            self.bot_instance = event.bot
-            logger.info("Bot实例已获取")
+        async with self._get_instance_lock:
+            if event.get_platform_name() == "aiocqhttp" and self.bot_instance is None and isinstance(event, AiocqhttpMessageEvent):
+                    self.bot_instance = event.bot
+                    logger.info("Bot实例已获取")
 
-        if self.bot_instance and (not self.group_ids):
-            try:
-                group_list = await self.bot_instance.get_group_list()
+            if self.bot_instance and (not self.group_ids):
+                try:
+                    group_list = await self.bot_instance.get_group_list()
 
-                for group in group_list:
-                    self.group_ids.append(group['group_id'])
+                    for group in group_list:
+                        self.group_ids.append(group['group_id'])
 
-                logger.info(f"加入群聊的id集合： {str(self.group_ids)}")
-            except Exception as e:
-                logger.error(f"无法列出群聊: {str(e)}")
+                    logger.info(f"加入群聊的id集合： {str(self.group_ids)}")
+                except Exception as e:
+                    logger.error(f"无法列出群聊: {str(e)}")
 
     async def _auto_sign_single(self, group_id):  # group_id是int
         payloads = {

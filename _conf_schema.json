@@ -24,7 +24,7 @@
         "default": ""
     },
     "autosign_delay": {
-        "description": "每日续火延迟(秒)",
+        "description": "对于每日续火，群与群之间的延迟(秒)",
         "type": "float",
         "hint": "",
         "default": 1.0
